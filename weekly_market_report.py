@@ -27,6 +27,7 @@ from datetime import date, datetime, timedelta
 from xml.etree import ElementTree as ET
 import os
 import sys
+import time
 
 try:
     from zoneinfo import ZoneInfo          # Python 3.9+
@@ -137,36 +138,86 @@ def energy_months(as_of):
 #  DATA FETCHING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fetch_close(ticker):
-    """Most recent close for any single Yahoo symbol, or None."""
+# Yahoo throttles bursts of requests from cloud servers with HTTP 429. To stay
+# under that, we (a) fetch in as few grouped calls as possible, (b) go sequential
+# rather than parallel, (c) pause between call groups, and (d) wait-and-retry with
+# growing delays whenever a batch comes back completely empty (the tell-tale sign
+# of a rate-limit rather than a genuinely missing contract).
+
+RETRY_DELAYS = [5, 15, 30, 60]   # seconds between retries of an empty batch
+GROUP_PAUSE  = 3                 # polite pause between call groups
+
+# Friendly names for equities (kept static to avoid extra rate-limited .info calls)
+EQUITY_NAMES = {"RPRX": "Royalty Pharma plc"}
+
+
+def _extract_close(data, sym, single):
+    """Pull the latest close for one symbol out of a yf.download result."""
     try:
-        hist = yf.Ticker(ticker).history(period="5d")
-        if hist.empty:
-            return None
-        return round(float(hist["Close"].dropna().iloc[-1]), 4)
+        col = (data["Close"] if single else data[sym]["Close"]).dropna()
+        if len(col):
+            return round(float(col.iloc[-1]), 4)
     except Exception:
-        return None
+        pass
+    return None
+
+
+def batched_closes(symbols, label=""):
+    """Fetch the latest close for a list of symbols in one grouped call, waiting
+    and retrying if Yahoo rate-limits us. Returns {symbol: price_or_None}."""
+    result = {s: None for s in symbols}
+    if not symbols:
+        return result
+
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        if attempt > 0:
+            delay = RETRY_DELAYS[attempt - 1]
+            print(f"    (Yahoo throttled {label}; waiting {delay}s then retrying "
+                  f"[{attempt}/{len(RETRY_DELAYS)}])")
+            time.sleep(delay)
+        try:
+            data = yf.download(symbols, period="5d", progress=False,
+                               group_by="ticker", threads=False)
+        except Exception as e:
+            print(f"    (download error for {label}: {e})")
+            data = None
+
+        got_any = False
+        if data is not None and not getattr(data, "empty", True):
+            single = (len(symbols) == 1)
+            for s in symbols:
+                if result[s] is None:
+                    px = _extract_close(data, s, single)
+                    if px is not None:
+                        result[s] = px
+                        got_any = True
+
+        if all(v is not None for v in result.values()):
+            break            # everything filled — done
+        if got_any:
+            break            # partial success → missing ones are likely just
+                             # unavailable contracts, not throttling; stop retrying
+        # else: got nothing at all → probably throttled → loop and retry
+
+    return result
 
 
 def fetch_quotes():
-    """Indices, EAFE proxy, FX, equities → list of (sym, name, price, group)."""
-    rows = []
-    print("  Quotes: indices...")
+    """Indices, EAFE proxy, FX, equities → list of (sym, name, price, group).
+    All fetched in ONE grouped call to minimize requests."""
+    print("  Quotes: fetching indices, EAFE, FX, equities in one batch...")
+    spec = []  # (sym, name, group)
     for sym, name in INDEX_TICKERS.items():
-        rows.append((sym, name, fetch_close(sym), "Index"))
-    print("  Quotes: EAFE proxy...")
+        spec.append((sym, name, "Index"))
     for sym, name in EAFE_PROXY.items():
-        rows.append((sym, name, fetch_close(sym), "Intl"))
-    print("  Quotes: FX...")
+        spec.append((sym, name, "Intl"))
     for sym, name in FX_TICKERS.items():
-        rows.append((sym, name, fetch_close(sym), "FX"))
-    print("  Quotes: equities...")
+        spec.append((sym, name, "FX"))
     for sym in STOCK_TICKERS:
-        try:
-            name = yf.Ticker(sym).info.get("shortName", sym)
-        except Exception:
-            name = sym
-        rows.append((sym, name, fetch_close(sym), "Equity"))
+        spec.append((sym, EQUITY_NAMES.get(sym, sym), "Equity"))
+
+    prices = batched_closes([s for s, _, _ in spec], label="quotes")
+    rows = [(sym, name, prices.get(sym), grp) for (sym, name, grp) in spec]
     for sym, name, price, grp in rows:
         print(f"    {sym:<10} {price if price is not None else 'N/A'}")
     return rows
@@ -174,41 +225,26 @@ def fetch_quotes():
 
 def fetch_energy_curve(root, months):
     """Fetch settlement/last for each (year,month) contract of `root`.
-    Tries the '=F' format first, then '.NYM' for anything still missing.
+    Tries the '=F' format in one batch, then '.NYM' for anything still missing.
     Returns {(year,month): price_or_None}."""
     prices = {ym: None for ym in months}
 
-    def batch(symbol_map):
-        """symbol_map: {symbol: (year,month)}. Fills prices in place."""
-        syms = list(symbol_map.keys())
-        if not syms:
-            return
-        try:
-            data = yf.download(syms, period="5d", progress=False,
-                               group_by="ticker", threads=True)
-        except Exception as e:
-            print(f"    ! batch download failed ({e}); trying one-by-one")
-            for s, ym in symbol_map.items():
-                if prices[ym] is None:
-                    prices[ym] = fetch_close(s)
-            return
-        for s, ym in symbol_map.items():
-            if prices[ym] is not None:
-                continue
-            try:
-                col = data[s]["Close"].dropna() if s in data else None
-                if col is not None and len(col):
-                    prices[ym] = round(float(col.iloc[-1]), 4)
-            except Exception:
-                pass
-
-    # Pass 1: '=F' symbols
+    # Pass 1: '=F' symbols, one grouped call (with throttle-retry)
     map_f = {energy_symbols(root, y, m)[0]: (y, m) for (y, m) in months}
-    batch(map_f)
-    # Pass 2: '.NYM' for the ones still missing
+    got_f = batched_closes(list(map_f.keys()), label=f"{root} strip")
+    for sym, ym in map_f.items():
+        if got_f.get(sym) is not None:
+            prices[ym] = got_f[sym]
+
+    # Pass 2: '.NYM' only for the still-missing months
     missing = [ym for ym in months if prices[ym] is None]
-    map_nym = {energy_symbols(root, y, m)[1]: (y, m) for (y, m) in missing}
-    batch(map_nym)
+    if missing:
+        time.sleep(GROUP_PAUSE)
+        map_nym = {energy_symbols(root, y, m)[1]: (y, m) for (y, m) in missing}
+        got_n = batched_closes(list(map_nym.keys()), label=f"{root} deferred")
+        for sym, ym in map_nym.items():
+            if got_n.get(sym) is not None:
+                prices[ym] = got_n[sym]
 
     got = sum(1 for v in prices.values() if v is not None)
     print(f"    {root}: {got}/{len(months)} contracts returned a quote")
@@ -435,11 +471,13 @@ def main():
         return
 
     quotes = fetch_quotes()
+    time.sleep(GROUP_PAUSE)
 
     months = energy_months(target)
     print(f"\n  Energy strip: {contract_label(*months[0])} → "
           f"{contract_label(*months[-1])} ({len(months)} months)")
     ng_prices = fetch_energy_curve("NG", months)
+    time.sleep(GROUP_PAUSE)
     cl_prices = fetch_energy_curve("CL", months)
     months = trim_leading_blank(months, ng_prices, cl_prices)
 
